@@ -1,29 +1,19 @@
-# pulldown-cmark
+# pulldown-dmark
 
-[![Build Status](https://dev.azure.com/raphlinus/pulldown-cmark/_apis/build/status/pulldown-cmark-CI?branchName=master)](https://dev.azure.com/raphlinus/pulldown-cmark/_build/latest?definitionId=2&branchName=master)
-[![Docs](https://docs.rs/pulldown-cmark/badge.svg)](https://docs.rs/pulldown-cmark)
-[![Crates.io](https://img.shields.io/crates/v/pulldown-cmark.svg?maxAge=2592000)](https://crates.io/crates/pulldown-cmark)
-
-[Documentation](https://docs.rs/pulldown-cmark/)
-
-This library is a pull parser for [CommonMark](http://commonmark.org/), written
-in [Rust](http://www.rust-lang.org/). It comes with a simple command-line tool,
-useful for rendering to HTML, and is also designed to be easy to use from as
-a library.
+This library is a pull parser for Discord-flavored Markdown, written in
+[Rust](https://rust-lang.org). It is designed to be easy to use as a library.
 
 It is designed to be:
 
 * Fast; a bare minimum of allocation and copying
 * Safe; written in pure Rust with no unsafe blocks (except in the opt-in SIMD feature)
 * Versatile; in particular source-maps are supported
-* Correct; the goal is 100% compliance with the [CommonMark spec](http://spec.commonmark.org/)
-
-Further, it optionally supports parsing footnotes,
-[Github flavored tables](https://github.github.com/gfm/#tables-extension-),
-[Github flavored task lists](https://github.github.com/gfm/#task-list-items-extension-) and
-[strikethrough](https://github.github.com/gfm/#strikethrough-extension-).
 
 Rustc 1.42 or newer is required to build the crate.
+
+`pulldown-dmark` is an adaptation of
+[`pulldown-cmark`](https://github.com/raphlinus/pulldown-cmark) with CommonMark features
+not supported by Discord removed.
 
 ## Why a pull parser?
 
@@ -144,9 +134,11 @@ pulldown-cmark = { version = "0.8", default-features = false, features = ["simd"
 
 ## Authors
 
-The main author is Raph Levien. The implementation of the new design (v0.3+) was completed by Marcus Klaas de Vries.
+The main author is Raph Levien. The implementation of the current design of
+`pulldown-cmark` (v0.3+) was completed by Marcus Klaas de Vries. `pulldown-dmark` was
+adapted from `pulldown-cmark` by ThatsNoMoon.
 
 ## Contributions
 
-We gladly accept contributions via GitHub pull requests. Please see
+I gladly accept contributions via GitHub pull requests. Please see
 [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
