@@ -28,15 +28,11 @@
 //!
 //! # Example
 //! ```rust
-//! use pulldown_cmark::{Parser, Options, html};
+//! use pulldown_dmark::{Parser, html};
 //!
 //! let markdown_input = "Hello world, this is a ~~complicated~~ *very simple* example.";
 //!
-//! // Set up options and parser. Strikethroughs are not part of the CommonMark standard
-//! // and we therefore must enable it explicitly.
-//! let mut options = Options::empty();
-//! options.insert(Options::ENABLE_STRIKETHROUGH);
-//! let parser = Parser::new_ext(markdown_input, options);
+//! let parser = Parser::new(markdown_input);
 //!
 //! // Write to String buffer.
 //! let mut html_output = String::new();
@@ -47,10 +43,6 @@
 //! assert_eq!(expected_html, &html_output);
 //! ```
 
-// When compiled for the rustc compiler itself we want to make sure that this is
-// an unstable crate.
-#![cfg_attr(rustbuild, feature(staged_api, rustc_private))]
-#![cfg_attr(rustbuild, unstable(feature = "rustc_private", issue = "27812"))]
 // Forbid unsafe code unless the SIMD feature is enabled.
 #![forbid(unsafe_code)]
 #![cfg_attr(feature = "simd", allow(unsafe_code))]
@@ -63,37 +55,14 @@ pub mod html;
 mod entities;
 pub mod escape;
 mod firstpass;
-mod linklabel;
 mod parse;
 mod puncttable;
 mod scanners;
 mod strings;
 mod tree;
 
-use std::{convert::TryFrom, fmt::Display};
-
-pub use crate::parse::{BrokenLink, BrokenLinkCallback, LinkDef, OffsetIter, Parser, RefDefs};
+pub use crate::parse::{LinkDef, OffsetIter, Parser};
 pub use crate::strings::{CowStr, InlineStr};
-
-/// Codeblock kind.
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum CodeBlockKind<'a> {
-    Indented,
-    /// The value contained in the tag describes the language of the code, which may be empty.
-    #[cfg_attr(feature = "serde", serde(borrow))]
-    Fenced(CowStr<'a>),
-}
-
-impl<'a> CodeBlockKind<'a> {
-    pub fn is_indented(&self) -> bool {
-        matches!(*self, CodeBlockKind::Indented)
-    }
-
-    pub fn is_fenced(&self) -> bool {
-        matches!(*self, CodeBlockKind::Fenced(_))
-    }
-}
 
 /// Tags for elements that can contain other elements.
 #[derive(Clone, Debug, PartialEq)]
@@ -102,122 +71,18 @@ pub enum Tag<'a> {
     /// A paragraph of text and other inline elements.
     Paragraph,
 
-    /// A heading. The field indicates the level of the heading.
-    Heading(HeadingLevel),
-
     BlockQuote,
-    /// A code block.
-    CodeBlock(CodeBlockKind<'a>),
-
-    /// A list. If the list is ordered the field indicates the number of the first item.
-    /// Contains only list items.
-    List(Option<u64>), // TODO: add delim and tight for ast (not needed for html)
-    /// A list item.
-    Item,
-    /// A footnote definition. The value contained is the footnote's label by which it can
-    /// be referred to.
+    /// A code block. The field is the syntax specified.
     #[cfg_attr(feature = "serde", serde(borrow))]
-    FootnoteDefinition(CowStr<'a>),
-
-    /// A table. Contains a vector describing the text-alignment for each of its columns.
-    Table(Vec<Alignment>),
-    /// A table header. Contains only `TableRow`s. Note that the table body starts immediately
-    /// after the closure of the `TableHead` tag. There is no `TableBody` tag.
-    TableHead,
-    /// A table row. Is used both for header rows as body rows. Contains only `TableCell`s.
-    TableRow,
-    TableCell,
+    CodeBlock(CowStr<'a>),
 
     // span-level tags
     Emphasis,
     Strong,
     Strikethrough,
 
-    /// A link. The first field is the link type, the second the destination URL and the third is a title.
-    Link(LinkType, CowStr<'a>, CowStr<'a>),
-
-    /// An image. The first field is the link type, the second the destination URL and the third is a title.
-    Image(LinkType, CowStr<'a>, CowStr<'a>),
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum HeadingLevel {
-    H1 = 1,
-    H2,
-    H3,
-    H4,
-    H5,
-    H6,
-}
-
-impl Display for HeadingLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::H1 => write!(f, "h1"),
-            Self::H2 => write!(f, "h2"),
-            Self::H3 => write!(f, "h3"),
-            Self::H4 => write!(f, "h4"),
-            Self::H5 => write!(f, "h5"),
-            Self::H6 => write!(f, "h6"),
-        }
-    }
-}
-
-/// Returned when trying to convert a `usize` into a `Heading` but it fails
-/// because the usize isn't a valid heading level
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub struct InvalidHeadingLevel(usize);
-
-impl TryFrom<usize> for HeadingLevel {
-    type Error = InvalidHeadingLevel;
-
-    fn try_from(value: usize) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::H1),
-            2 => Ok(Self::H2),
-            3 => Ok(Self::H3),
-            4 => Ok(Self::H4),
-            5 => Ok(Self::H5),
-            6 => Ok(Self::H6),
-            _ => Err(InvalidHeadingLevel(value)),
-        }
-    }
-}
-
-/// Type specifier for inline links. See [the Tag::Link](enum.Tag.html#variant.Link) for more information.
-#[derive(Clone, Debug, PartialEq, Copy)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum LinkType {
-    /// Inline link like `[foo](bar)`
-    Inline,
-    /// Reference link like `[foo][bar]`
-    Reference,
-    /// Reference without destination in the document, but resolved by the broken_link_callback
-    ReferenceUnknown,
-    /// Collapsed link like `[foo][]`
-    Collapsed,
-    /// Collapsed link without destination in the document, but resolved by the broken_link_callback
-    CollapsedUnknown,
-    /// Shortcut link like `[foo]`
-    Shortcut,
-    /// Shortcut without destination in the document, but resolved by the broken_link_callback
-    ShortcutUnknown,
-    /// Autolink like `<http://foo.bar/baz>`
-    Autolink,
-    /// Email address in autolink like `<john@example.org>`
-    Email,
-}
-
-impl LinkType {
-    fn to_unknown(self) -> Self {
-        match self {
-            LinkType::Reference => LinkType::ReferenceUnknown,
-            LinkType::Collapsed => LinkType::CollapsedUnknown,
-            LinkType::Shortcut => LinkType::ShortcutUnknown,
-            _ => unreachable!(),
-        }
-    }
+    /// A link. The first field is the destination URL, and the second is a title.
+    Link(CowStr<'a>, CowStr<'a>),
 }
 
 /// Markdown events that are generated in a preorder traversal of the document
@@ -240,22 +105,10 @@ pub enum Event<'a> {
     /// An inline code node.
     #[cfg_attr(feature = "serde", serde(borrow))]
     Code(CowStr<'a>),
-    /// An HTML node.
-    #[cfg_attr(feature = "serde", serde(borrow))]
-    Html(CowStr<'a>),
-    /// A reference to a footnote with given label, which may or may not be defined
-    /// by an event with a `Tag::FootnoteDefinition` tag. Definitions and references to them may
-    /// occur in any order.
-    #[cfg_attr(feature = "serde", serde(borrow))]
-    FootnoteReference(CowStr<'a>),
     /// A soft line break.
     SoftBreak,
     /// A hard line break.
     HardBreak,
-    /// A horizontal ruler.
-    Rule,
-    /// A task list marker, rendered as a checkbox in HTML. Contains a true when it is checked.
-    TaskListMarker(bool),
 }
 
 /// Table column text alignment.
@@ -268,16 +121,4 @@ pub enum Alignment {
     Left,
     Center,
     Right,
-}
-
-bitflags::bitflags! {
-    /// Option struct containing flags for enabling extra features
-    /// that are not part of the CommonMark spec.
-    pub struct Options: u32 {
-        const ENABLE_TABLES = 1 << 1;
-        const ENABLE_FOOTNOTES = 1 << 2;
-        const ENABLE_STRIKETHROUGH = 1 << 3;
-        const ENABLE_TASKLISTS = 1 << 4;
-        const ENABLE_SMART_PUNCTUATION = 1 << 5;
-    }
 }

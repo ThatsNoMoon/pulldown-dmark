@@ -22,20 +22,20 @@
 
 #![forbid(unsafe_code)]
 
-use pulldown_cmark::{html, Options, Parser};
+use pulldown_dmark::{html, Parser};
 
 use std::env;
 use std::io::{self, Read};
 use std::mem;
 
-fn dry_run(text: &str, opts: Options) {
-    let p = Parser::new_ext(text, opts);
+fn dry_run(text: &str) {
+    let p = Parser::new(text);
     let count = p.count();
     println!("{} events", count);
 }
 
-fn print_events(text: &str, opts: Options) {
-    let parser = Parser::new_ext(text, opts).into_offset_iter();
+fn print_events(text: &str) {
+    let parser = Parser::new(text).into_offset_iter();
     for (event, range) in parser {
         println!("{:?}: {:?}", range, event);
     }
@@ -55,15 +55,6 @@ pub fn main() -> std::io::Result<()> {
     opts.optflag("h", "help", "this help message");
     opts.optflag("d", "dry-run", "dry run, produce no output");
     opts.optflag("e", "events", "print event sequence instead of rendering");
-    opts.optflag("T", "enable-tables", "enable GitHub-style tables");
-    opts.optflag("F", "enable-footnotes", "enable Hoedown-style footnotes");
-    opts.optflag(
-        "S",
-        "enable-strikethrough",
-        "enable GitHub-style strikethrough",
-    );
-    opts.optflag("L", "enable-tasklists", "enable GitHub-style task lists");
-    opts.optflag("P", "enable-smart-punctuation", "enable smart punctuation");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -76,31 +67,15 @@ pub fn main() -> std::io::Result<()> {
         println!("{}", opts.usage(&brief(&args[0])));
         return Ok(());
     }
-    let mut opts = Options::empty();
-    if matches.opt_present("enable-tables") {
-        opts.insert(Options::ENABLE_TABLES);
-    }
-    if matches.opt_present("enable-footnotes") {
-        opts.insert(Options::ENABLE_FOOTNOTES);
-    }
-    if matches.opt_present("enable-strikethrough") {
-        opts.insert(Options::ENABLE_STRIKETHROUGH);
-    }
-    if matches.opt_present("enable-tasklists") {
-        opts.insert(Options::ENABLE_TASKLISTS);
-    }
-    if matches.opt_present("enable-smart-punctuation") {
-        opts.insert(Options::ENABLE_SMART_PUNCTUATION);
-    }
 
     let mut input = String::new();
     io::stdin().lock().read_to_string(&mut input)?;
     if matches.opt_present("events") {
-        print_events(&input, opts);
+        print_events(&input);
     } else if matches.opt_present("dry-run") {
-        dry_run(&input, opts);
+        dry_run(&input);
     } else {
-        let mut p = Parser::new_ext(&input, opts);
+        let mut p = Parser::new(&input);
         let stdio = io::stdout();
         let buffer = std::io::BufWriter::with_capacity(1024 * 1024, stdio.lock());
         html::write_html(buffer, &mut p)?;

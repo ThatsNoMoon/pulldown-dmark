@@ -3,11 +3,5 @@
 
 pub use super::test_markdown_html;
 
-mod footnotes;
 mod gfm_strikethrough;
-mod gfm_table;
-mod gfm_tasklist;
 mod regression;
-mod smart_punct;
-mod spec;
-mod table;

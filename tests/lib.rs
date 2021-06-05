@@ -1,7 +1,7 @@
 use html5ever::serialize::{serialize, SerializeOpts};
 use html5ever::{driver as html, local_name, namespace_url, ns, QualName};
 use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
-use pulldown_cmark::{Options, Parser};
+use pulldown_dmark::Parser;
 
 use regex::Regex;
 use std::collections::HashSet;
@@ -12,20 +12,11 @@ use tendril::stream::TendrilSink;
 mod suite;
 
 #[inline(never)]
-pub fn test_markdown_html(input: &str, output: &str, smart_punct: bool) {
+pub fn test_markdown_html(input: &str, output: &str) {
     let mut s = String::new();
 
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_FOOTNOTES);
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TASKLISTS);
-    if smart_punct {
-        opts.insert(Options::ENABLE_SMART_PUNCTUATION);
-    }
-
-    let p = Parser::new_ext(input, opts);
-    pulldown_cmark::html::push_html(&mut s, p);
+    let p = Parser::new(input);
+    pulldown_dmark::html::push_html(&mut s, p);
 
     assert_eq!(normalize_html(output), normalize_html(&s));
 }

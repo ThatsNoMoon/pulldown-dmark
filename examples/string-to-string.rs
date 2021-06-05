@@ -1,4 +1,4 @@
-use pulldown_cmark::{html, Options, Parser};
+use pulldown_dmark::{html, Parser};
 
 fn main() {
     let markdown_input: &str = "Hello world, this is a ~~complicated~~ *very simple* example.";
@@ -6,9 +6,7 @@ fn main() {
 
     // Set up options and parser. Strikethroughs are not part of the CommonMark standard
     // and we therefore must enable it explicitly.
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser = Parser::new_ext(markdown_input, options);
+    let parser = Parser::new(markdown_input);
 
     // Write to String buffer.
     let mut html_output: String = String::with_capacity(markdown_input.len() * 3 / 2);

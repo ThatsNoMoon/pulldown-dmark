@@ -1,21 +1,21 @@
 use std::io::Write as _;
 
-use pulldown_cmark::{html, Event, Options, Parser, Tag};
+use pulldown_dmark::{html, Event, Parser, Tag};
 
 fn main() {
-    let markdown_input: &str = "This is Peter on ![holiday in Greece](pearl_beach.jpg).";
+    let markdown_input: &str = "I wrote some code!\n```\nprint(\"hello, world\")\n```";
     println!("Parsing the following markdown string:\n{}", markdown_input);
 
     // Set up parser. We can treat is as any other iterator. We replace Peter by John
     // and image by its alt text.
-    let parser = Parser::new_ext(markdown_input, Options::empty())
+    let parser = Parser::new(markdown_input)
         .map(|event| match event {
-            Event::Text(text) => Event::Text(text.replace("Peter", "John").into()),
+            Event::Start(Tag::CodeBlock(_)) => Event::Start(Tag::CodeBlock("python".into())),
             _ => event,
         })
         .filter(|event| match event {
-            Event::Start(Tag::Image(..)) | Event::End(Tag::Image(..)) => false,
-            _ => true,
+            Event::Start(Tag::CodeBlock(..)) | Event::End(Tag::CodeBlock(..)) => true,
+            _ => false,
         });
 
     // Write to anything implementing the `Write` trait. This could also be a file

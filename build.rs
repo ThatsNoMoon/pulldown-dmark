@@ -27,13 +27,7 @@ fn generate_tests_from_spec() {
     // This is a hardcoded path to the CommonMark spec because it is not situated in
     // the specs/ directory. It's in an array to easily chain it to the other iterator
     // and make it easy to eventually add other hardcoded paths in the future if needed
-    let hardcoded = [
-        "./third_party/CommonMark/spec.txt",
-        "./third_party/CommonMark/smart_punct.txt",
-        "./third_party/GitHub/gfm_table.txt",
-        "./third_party/GitHub/gfm_strikethrough.txt",
-        "./third_party/GitHub/gfm_tasklist.txt",
-    ];
+    let hardcoded = ["./third_party/GitHub/gfm_strikethrough.txt"];
     let hardcoded_iter = hardcoded.iter().map(PathBuf::from);
 
     // Create an iterator over the files in the specs/ directory that have a .txt extension
@@ -83,14 +77,13 @@ fn {}_test_{i}() {{
     let original = r##"{original}"##;
     let expected = r##"{expected}"##;
 
-    test_markdown_html(original, expected, {smart_punct});
+    test_markdown_html(original, expected);
 }}
 "###,
                     spec_name,
                     i = i + 1,
                     original = testcase.original,
                     expected = testcase.expected,
-                    smart_punct = testcase.smart_punct,
                 ))
                 .unwrap();
 
@@ -143,7 +136,6 @@ impl<'a> Spec<'a> {
 pub struct TestCase {
     pub original: String,
     pub expected: String,
-    pub smart_punct: bool,
 }
 
 #[cfg(feature = "gen-tests")]
@@ -154,12 +146,9 @@ impl<'a> Iterator for Spec<'a> {
         let spec = self.spec;
         let prefix = "```````````````````````````````` example";
 
-        let (i_start, smart_punct) = self.spec.find(prefix).and_then(|pos| {
-            let suffix = "_smartpunct\n";
-            if spec[(pos + prefix.len())..].starts_with(suffix) {
-                Some((pos + prefix.len() + suffix.len(), true))
-            } else if spec[(pos + prefix.len())..].starts_with('\n') {
-                Some((pos + prefix.len() + 1, false))
+        let i_start = self.spec.find(prefix).and_then(|pos| {
+            if spec[(pos + prefix.len())..].starts_with('\n') {
+                Some(pos + prefix.len() + 1)
             } else {
                 None
             }
@@ -178,7 +167,6 @@ impl<'a> Iterator for Spec<'a> {
         let test_case = TestCase {
             original: spec[i_start..i_end].to_string().replace("→", "\t"),
             expected: spec[i_end + 2..e_end].to_string().replace("→", "\t"),
-            smart_punct,
         };
 
         Some(test_case)

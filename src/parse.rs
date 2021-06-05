@@ -25,14 +25,11 @@ use std::collections::{HashMap, VecDeque};
 use std::iter::FusedIterator;
 use std::ops::{Index, Range};
 
-use unicase::UniCase;
-
 use crate::firstpass::run_first_pass;
-use crate::linklabel::{scan_link_label_rest, LinkLabel, ReferenceLabel};
 use crate::scanners::*;
 use crate::strings::CowStr;
 use crate::tree::{Tree, TreeIndex};
-use crate::{Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Tag};
+use crate::{Alignment, Event, Tag};
 
 // Allowing arbitrary depth nested parentheses inside link destinations
 // can create denial of service vulnerabilities if we're not careful.
@@ -60,13 +57,10 @@ pub(crate) enum ItemBody {
     // repeats, can_open, can_close
     MaybeEmphasis(usize, bool, bool),
     // quote byte, can_open, can_close
-    MaybeSmartQuote(u8, bool, bool),
     MaybeCode(usize, bool), // number of backticks, preceeded by backslash
-    MaybeHtml,
     MaybeLinkOpen,
     // bool indicates whether or not the preceeding section could be a reference
     MaybeLinkClose(bool),
-    MaybeImage,
 
     // These are inline items after resolution.
     Emphasis,
@@ -74,28 +68,10 @@ pub(crate) enum ItemBody {
     Strikethrough,
     Code(CowIndex),
     Link(LinkIndex),
-    Image(LinkIndex),
-    FootnoteReference(CowIndex),
-    TaskListMarker(bool), // true for checked
 
-    Rule,
-    Heading(HeadingLevel), // heading level
     FencedCodeBlock(CowIndex),
-    IndentCodeBlock,
-    Html,
-    OwnedHtml(CowIndex),
     BlockQuote,
-    List(bool, u8, u64), // is_tight, list character, list start index
-    ListItem(usize),     // indent level
     SynthesizeText(CowIndex),
-    SynthesizeChar(char),
-    FootnoteDefinition(CowIndex),
-
-    // Tables
-    Table(AlignmentIndex),
-    TableHead,
-    TableRow,
-    TableCell,
 
     // Dummy node at the top of the tree - should not be used otherwise!
     Root,
@@ -106,12 +82,9 @@ impl<'a> ItemBody {
         matches!(
             *self,
             ItemBody::MaybeEmphasis(..)
-                | ItemBody::MaybeSmartQuote(..)
-                | ItemBody::MaybeHtml
                 | ItemBody::MaybeCode(..)
                 | ItemBody::MaybeLinkOpen
                 | ItemBody::MaybeLinkClose(..)
-                | ItemBody::MaybeImage
         )
     }
 }
@@ -122,68 +95,30 @@ impl<'a> Default for ItemBody {
     }
 }
 
-pub struct BrokenLink<'a> {
-    pub span: std::ops::Range<usize>,
-    pub link_type: LinkType,
-    pub reference: CowStr<'a>,
-}
-
 /// Markdown event iterator.
-pub struct Parser<'input, 'callback> {
+pub struct Parser<'input> {
     text: &'input str,
-    options: Options,
     tree: Tree<Item>,
     allocs: Allocations<'input>,
-    broken_link_callback: BrokenLinkCallback<'input, 'callback>,
-    html_scan_guard: HtmlScanGuard,
-
     // used by inline passes. store them here for reuse
     inline_stack: InlineStack,
     link_stack: LinkStack,
 }
 
-impl<'input, 'callback> Parser<'input, 'callback> {
-    /// Creates a new event iterator for a markdown string without any options enabled.
+impl<'input> Parser<'input> {
+    /// Creates a new event iterator for a markdown string.
     pub fn new(text: &'input str) -> Self {
-        Parser::new_ext(text, Options::empty())
-    }
-
-    /// Creates a new event iterator for a markdown string with given options.
-    pub fn new_ext(text: &'input str, options: Options) -> Self {
-        Parser::new_with_broken_link_callback(text, options, None)
-    }
-
-    /// In case the parser encounters any potential links that have a broken
-    /// reference (e.g `[foo]` when there is no `[foo]: ` entry at the bottom)
-    /// the provided callback will be called with the reference name,
-    /// and the returned pair will be used as the link name and title if it is not
-    /// `None`.
-    pub fn new_with_broken_link_callback(
-        text: &'input str,
-        options: Options,
-        broken_link_callback: BrokenLinkCallback<'input, 'callback>,
-    ) -> Self {
-        let (mut tree, allocs) = run_first_pass(text, options);
+        let (mut tree, allocs) = run_first_pass(text);
         tree.reset();
         let inline_stack = Default::default();
         let link_stack = Default::default();
-        let html_scan_guard = Default::default();
         Parser {
             text,
-            options,
             tree,
             allocs,
-            broken_link_callback,
             inline_stack,
             link_stack,
-            html_scan_guard,
         }
-    }
-
-    /// Returns a reference to the internal `RefDefs` object, which provides access
-    /// to the internal map of reference definitions.
-    pub fn reference_definitions(&self) -> &RefDefs {
-        &self.allocs.refdefs
     }
 
     /// Handle inline markup.
@@ -212,63 +147,6 @@ impl<'input, 'callback> Parser<'input, 'callback> {
 
         while let Some(mut cur_ix) = cur {
             match self.tree[cur_ix].item.body {
-                ItemBody::MaybeHtml => {
-                    let next = self.tree[cur_ix].next;
-                    let autolink = if let Some(next_ix) = next {
-                        scan_autolink(block_text, self.tree[next_ix].item.start)
-                    } else {
-                        None
-                    };
-
-                    if let Some((ix, uri, link_type)) = autolink {
-                        let node = scan_nodes_to_ix(&self.tree, next, ix);
-                        let text_node = self.tree.create_node(Item {
-                            start: self.tree[cur_ix].item.start + 1,
-                            end: ix - 1,
-                            body: ItemBody::Text,
-                        });
-                        let link_ix = self.allocs.allocate_link(link_type, uri, "".into());
-                        self.tree[cur_ix].item.body = ItemBody::Link(link_ix);
-                        self.tree[cur_ix].item.end = ix;
-                        self.tree[cur_ix].next = node;
-                        self.tree[cur_ix].child = Some(text_node);
-                        prev = cur;
-                        cur = node;
-                        if let Some(node_ix) = cur {
-                            self.tree[node_ix].item.start = max(self.tree[node_ix].item.start, ix);
-                        }
-                        continue;
-                    } else {
-                        let inline_html = next.and_then(|next_ix| {
-                            self.scan_inline_html(
-                                block_text.as_bytes(),
-                                self.tree[next_ix].item.start,
-                            )
-                        });
-                        if let Some((span, ix)) = inline_html {
-                            let node = scan_nodes_to_ix(&self.tree, next, ix);
-                            self.tree[cur_ix].item.body = if !span.is_empty() {
-                                let converted_string =
-                                    String::from_utf8(span).expect("invalid utf8");
-                                ItemBody::OwnedHtml(
-                                    self.allocs.allocate_cow(converted_string.into()),
-                                )
-                            } else {
-                                ItemBody::Html
-                            };
-                            self.tree[cur_ix].item.end = ix;
-                            self.tree[cur_ix].next = node;
-                            prev = cur;
-                            cur = node;
-                            if let Some(node_ix) = cur {
-                                self.tree[node_ix].item.start =
-                                    max(self.tree[node_ix].item.start, ix);
-                            }
-                            continue;
-                        }
-                    }
-                    self.tree[cur_ix].item.body = ItemBody::Text;
-                }
                 ItemBody::MaybeCode(mut search_count, preceded_by_backslash) => {
                     if preceded_by_backslash {
                         search_count -= 1;
@@ -322,14 +200,7 @@ impl<'input, 'callback> Parser<'input, 'callback> {
                         ty: LinkStackTy::Link,
                     });
                 }
-                ItemBody::MaybeImage => {
-                    self.tree[cur_ix].item.body = ItemBody::Text;
-                    self.link_stack.push(LinkStackEl {
-                        node: cur_ix,
-                        ty: LinkStackTy::Image,
-                    });
-                }
-                ItemBody::MaybeLinkClose(could_be_ref) => {
+                ItemBody::MaybeLinkClose(_) => {
                     self.tree[cur_ix].item.body = ItemBody::Text;
                     if let Some(tos) = self.link_stack.pop() {
                         if tos.ty == LinkStackTy::Disabled {
@@ -345,12 +216,8 @@ impl<'input, 'callback> Parser<'input, 'callback> {
                             }
                             cur = Some(tos.node);
                             cur_ix = tos.node;
-                            let link_ix = self.allocs.allocate_link(LinkType::Inline, url, title);
-                            self.tree[cur_ix].item.body = if tos.ty == LinkStackTy::Image {
-                                ItemBody::Image(link_ix)
-                            } else {
-                                ItemBody::Link(link_ix)
-                            };
+                            let link_ix = self.allocs.allocate_link(url, title);
+                            self.tree[cur_ix].item.body = ItemBody::Link(link_ix);
                             self.tree[cur_ix].child = self.tree[cur_ix].next;
                             self.tree[cur_ix].next = next_node;
                             self.tree[cur_ix].item.end = next_ix;
@@ -361,150 +228,6 @@ impl<'input, 'callback> Parser<'input, 'callback> {
 
                             if tos.ty == LinkStackTy::Link {
                                 self.link_stack.disable_all_links();
-                            }
-                        } else {
-                            // ok, so its not an inline link. maybe it is a reference
-                            // to a defined link?
-                            let scan_result = scan_reference(
-                                &self.tree,
-                                block_text,
-                                next,
-                                self.options.contains(Options::ENABLE_FOOTNOTES),
-                            );
-                            let (node_after_link, link_type) = match scan_result {
-                                // [label][reference]
-                                RefScan::LinkLabel(_, end_ix) => {
-                                    // Toggle reference viability of the last closing bracket,
-                                    // so that we can skip it on future iterations in case
-                                    // it fails in this one. In particular, we won't call
-                                    // the broken link callback twice on one reference.
-                                    let reference_close_node =
-                                        scan_nodes_to_ix(&self.tree, next, end_ix - 1).unwrap();
-                                    self.tree[reference_close_node].item.body =
-                                        ItemBody::MaybeLinkClose(false);
-                                    let next_node = self.tree[reference_close_node].next;
-
-                                    (next_node, LinkType::Reference)
-                                }
-                                // [reference][]
-                                RefScan::Collapsed(next_node) => {
-                                    // This reference has already been tried, and it's not
-                                    // valid. Skip it.
-                                    if !could_be_ref {
-                                        continue;
-                                    }
-                                    (next_node, LinkType::Collapsed)
-                                }
-                                // [shortcut]
-                                //
-                                // [shortcut]: /blah
-                                RefScan::Failed => {
-                                    if !could_be_ref {
-                                        continue;
-                                    }
-                                    (next, LinkType::Shortcut)
-                                }
-                            };
-
-                            // FIXME: references and labels are mixed in the naming of variables
-                            // below. Disambiguate!
-
-                            // (label, source_ix end)
-                            let label: Option<(ReferenceLabel<'input>, usize)> = match scan_result {
-                                RefScan::LinkLabel(l, end_ix) => {
-                                    Some((ReferenceLabel::Link(l), end_ix))
-                                }
-                                RefScan::Collapsed(..) | RefScan::Failed => {
-                                    // No label? maybe it is a shortcut reference
-                                    let label_start = self.tree[tos.node].item.end - 1;
-                                    scan_link_label(
-                                        &self.tree,
-                                        &self.text[label_start..self.tree[cur_ix].item.end],
-                                        self.options.contains(Options::ENABLE_FOOTNOTES),
-                                    )
-                                    .map(|(ix, label)| (label, label_start + ix))
-                                }
-                            };
-
-                            // see if it's a footnote reference
-                            if let Some((ReferenceLabel::Footnote(l), end)) = label {
-                                self.tree[tos.node].next = node_after_link;
-                                self.tree[tos.node].child = None;
-                                self.tree[tos.node].item.body =
-                                    ItemBody::FootnoteReference(self.allocs.allocate_cow(l));
-                                self.tree[tos.node].item.end = end;
-                                prev = Some(tos.node);
-                                cur = node_after_link;
-                                self.link_stack.clear();
-                                continue;
-                            } else if let Some((ReferenceLabel::Link(link_label), end)) = label {
-                                let type_url_title = self
-                                    .allocs
-                                    .refdefs
-                                    .get(link_label.as_ref())
-                                    .map(|matching_def| {
-                                        // found a matching definition!
-                                        let title = matching_def
-                                            .title
-                                            .as_ref()
-                                            .cloned()
-                                            .unwrap_or_else(|| "".into());
-                                        let url = matching_def.dest.clone();
-                                        (link_type, url, title)
-                                    })
-                                    .or_else(|| {
-                                        match self.broken_link_callback.as_mut() {
-                                            Some(callback) => {
-                                                // Construct a BrokenLink struct, which will be passed to the callback
-                                                let broken_link = BrokenLink {
-                                                    span: (self.tree[tos.node].item.start)..end,
-                                                    link_type,
-                                                    reference: link_label,
-                                                };
-
-                                                callback(broken_link).map(|(url, title)| {
-                                                    (link_type.to_unknown(), url, title)
-                                                })
-                                            }
-                                            None => None,
-                                        }
-                                    });
-
-                                if let Some((def_link_type, url, title)) = type_url_title {
-                                    let link_ix =
-                                        self.allocs.allocate_link(def_link_type, url, title);
-                                    self.tree[tos.node].item.body = if tos.ty == LinkStackTy::Image
-                                    {
-                                        ItemBody::Image(link_ix)
-                                    } else {
-                                        ItemBody::Link(link_ix)
-                                    };
-                                    let label_node = self.tree[tos.node].next;
-
-                                    // lets do some tree surgery to add the link to the tree
-                                    // 1st: skip the label node and close node
-                                    self.tree[tos.node].next = node_after_link;
-
-                                    // then, if it exists, add the label node as a child to the link node
-                                    if label_node != cur {
-                                        self.tree[tos.node].child = label_node;
-
-                                        // finally: disconnect list of children
-                                        if let Some(prev_ix) = prev {
-                                            self.tree[prev_ix].next = None;
-                                        }
-                                    }
-
-                                    self.tree[tos.node].item.end = end;
-
-                                    // set up cur so next node will be node_after_link
-                                    cur = Some(tos.node);
-                                    cur_ix = tos.node;
-
-                                    if tos.ty == LinkStackTy::Link {
-                                        self.link_stack.disable_all_links();
-                                    }
-                                }
                             }
                         }
                     }
@@ -521,9 +244,6 @@ impl<'input, 'callback> Parser<'input, 'callback> {
         let mut prev = None;
         let mut prev_ix: TreeIndex;
         let mut cur = self.tree.cur();
-
-        let mut single_quote_open: Option<TreeIndex> = None;
-        let mut double_quote_open: bool = false;
 
         while let Some(mut cur_ix) = cur {
             match self.tree[cur_ix].item.body {
@@ -601,32 +321,6 @@ impl<'input, 'callback> Parser<'input, 'callback> {
                         prev = Some(prev_ix);
                         cur = self.tree[prev_ix].next;
                     }
-                }
-                ItemBody::MaybeSmartQuote(c, can_open, can_close) => {
-                    self.tree[cur_ix].item.body = match c {
-                        b'\'' => {
-                            if let (Some(open_ix), true) = (single_quote_open, can_close) {
-                                self.tree[open_ix].item.body = ItemBody::SynthesizeChar('‘');
-                                single_quote_open = None;
-                            } else if can_open {
-                                single_quote_open = Some(cur_ix);
-                            }
-                            ItemBody::SynthesizeChar('’')
-                        }
-                        _ /* double quote */ => {
-                            if can_close && double_quote_open {
-                                double_quote_open = false;
-                                ItemBody::SynthesizeChar('”')
-                            } else {
-                                if can_open && !double_quote_open {
-                                    double_quote_open = true;
-                                }
-                                ItemBody::SynthesizeChar('“')
-                            }
-                        }
-                    };
-                    prev = cur;
-                    cur = self.tree[cur_ix].next;
                 }
                 _ => {
                     prev = cur;
@@ -715,15 +409,6 @@ impl<'input, 'callback> Parser<'input, 'callback> {
                         mark = i;
                         continue;
                     }
-                }
-            }
-            if c == b'&' {
-                if let (n, Some(value)) = scan_entity(&bytes[i..]) {
-                    title.push_str(&text[mark..i]);
-                    title.push_str(&value);
-                    i += n;
-                    mark = i;
-                    continue;
                 }
             }
             if c == b'\\' && i + 1 < bytes.len() && is_ascii_punctuation(bytes[i + 1]) {
@@ -822,39 +507,10 @@ impl<'input, 'callback> Parser<'input, 'callback> {
         }
     }
 
-    /// On success, returns a buffer containing the inline html and byte offset.
-    /// When no bytes were skipped, the buffer will be empty and the html can be
-    /// represented as a subslice of the input string.
-    fn scan_inline_html(&mut self, bytes: &[u8], ix: usize) -> Option<(Vec<u8>, usize)> {
-        let c = *bytes.get(ix)?;
-        if c == b'!' {
-            Some((
-                vec![],
-                scan_inline_html_comment(bytes, ix + 1, &mut self.html_scan_guard)?,
-            ))
-        } else if c == b'?' {
-            Some((
-                vec![],
-                scan_inline_html_processing(bytes, ix + 1, &mut self.html_scan_guard)?,
-            ))
-        } else {
-            let (span, i) = scan_html_block_inner(
-                // Subtract 1 to include the < character
-                &bytes[(ix - 1)..],
-                Some(&|_bytes| {
-                    let mut line_start = LineStart::new(bytes);
-                    let _ = scan_containers(&self.tree, &mut line_start);
-                    line_start.bytes_scanned()
-                }),
-            )?;
-            Some((span, i + ix - 1))
-        }
-    }
-
     /// Consumes the event iterator and produces an iterator that produces
     /// `(Event, Range)` pairs, where the `Range` value maps to the corresponding
     /// range in the markdown source.
-    pub fn into_offset_iter(self) -> OffsetIter<'input, 'callback> {
+    pub fn into_offset_iter(self) -> OffsetIter<'input> {
         OffsetIter { inner: self }
     }
 }
@@ -867,13 +523,6 @@ pub(crate) fn scan_containers(tree: &Tree<Item>, line_start: &mut LineStart) -> 
             ItemBody::BlockQuote => {
                 // `scan_blockquote_marker` saves & restores internally
                 if !line_start.scan_blockquote_marker() {
-                    break;
-                }
-            }
-            ItemBody::ListItem(indent) => {
-                let save = line_start.clone();
-                if !line_start.scan_space(indent) && !line_start.is_at_eol() {
-                    *line_start = save;
                     break;
                 }
             }
@@ -1014,15 +663,6 @@ impl InlineStack {
     }
 }
 
-#[derive(Debug, Clone)]
-enum RefScan<'a> {
-    // label, source ix of label end
-    LinkLabel(CowStr<'a>, usize),
-    // contains next node index
-    Collapsed(Option<TreeIndex>),
-    Failed,
-}
-
 /// Skips forward within a block to a node which spans (ends inclusive) the given
 /// index into the source.
 fn scan_nodes_to_ix(
@@ -1038,57 +678,6 @@ fn scan_nodes_to_ix(
         }
     }
     node
-}
-
-/// Scans an inline link label, which cannot be interrupted.
-/// Returns number of bytes (including brackets) and label on success.
-fn scan_link_label<'text, 'tree>(
-    tree: &'tree Tree<Item>,
-    text: &'text str,
-    allow_footnote_refs: bool,
-) -> Option<(usize, ReferenceLabel<'text>)> {
-    let bytes = &text.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'[' {
-        return None;
-    }
-    let linebreak_handler = |bytes: &[u8]| {
-        let mut line_start = LineStart::new(bytes);
-        let _ = scan_containers(tree, &mut line_start);
-        Some(line_start.bytes_scanned())
-    };
-    let pair = if allow_footnote_refs && b'^' == bytes[1] {
-        let (byte_index, cow) = scan_link_label_rest(&text[2..], &linebreak_handler)?;
-        (byte_index + 2, ReferenceLabel::Footnote(cow))
-    } else {
-        let (byte_index, cow) = scan_link_label_rest(&text[1..], &linebreak_handler)?;
-        (byte_index + 1, ReferenceLabel::Link(cow))
-    };
-    Some(pair)
-}
-
-fn scan_reference<'a, 'b>(
-    tree: &'a Tree<Item>,
-    text: &'b str,
-    cur: Option<TreeIndex>,
-    allow_footnote_refs: bool,
-) -> RefScan<'b> {
-    let cur_ix = match cur {
-        None => return RefScan::Failed,
-        Some(cur_ix) => cur_ix,
-    };
-    let start = tree[cur_ix].item.start;
-    let tail = &text.as_bytes()[start..];
-
-    if tail.starts_with(b"[]") {
-        let closing_node = tree[cur_ix].next.unwrap();
-        RefScan::Collapsed(tree[closing_node].next)
-    } else if let Some((ix, ReferenceLabel::Link(label))) =
-        scan_link_label(tree, &text[start..], allow_footnote_refs)
-    {
-        RefScan::LinkLabel(label, start + ix)
-    } else {
-        RefScan::Failed
-    }
 }
 
 #[derive(Clone, Default)]
@@ -1132,7 +721,6 @@ struct LinkStackEl {
 #[derive(PartialEq, Clone, Debug)]
 enum LinkStackTy {
     Link,
-    Image,
     Disabled,
 }
 
@@ -1202,35 +790,14 @@ pub(crate) struct AlignmentIndex(usize);
 
 #[derive(Clone)]
 pub(crate) struct Allocations<'a> {
-    pub refdefs: RefDefs<'a>,
-    links: Vec<(LinkType, CowStr<'a>, CowStr<'a>)>,
+    links: Vec<(CowStr<'a>, CowStr<'a>)>,
     cows: Vec<CowStr<'a>>,
     alignments: Vec<Vec<Alignment>>,
-}
-
-/// Keeps track of the reference definitions defined in the document.
-#[derive(Clone, Default)]
-pub struct RefDefs<'input>(pub(crate) HashMap<LinkLabel<'input>, LinkDef<'input>>);
-
-impl<'input, 'b, 's> RefDefs<'input>
-where
-    's: 'b,
-{
-    /// Performs a lookup on reference label using unicode case folding.
-    pub fn get(&'s self, key: &'b str) -> Option<&'b LinkDef<'input>> {
-        self.0.get(&UniCase::new(key.into()))
-    }
-
-    /// Provides an iterator over all the document's reference definitions.
-    pub fn iter(&'s self) -> impl Iterator<Item = (&'s str, &'s LinkDef<'input>)> {
-        self.0.iter().map(|(k, v)| (k.as_ref(), v))
-    }
 }
 
 impl<'a> Allocations<'a> {
     pub fn new() -> Self {
         Self {
-            refdefs: RefDefs::default(),
             links: Vec::with_capacity(128),
             cows: Vec::new(),
             alignments: Vec::new(),
@@ -1243,16 +810,10 @@ impl<'a> Allocations<'a> {
         CowIndex(ix)
     }
 
-    pub fn allocate_link(&mut self, ty: LinkType, url: CowStr<'a>, title: CowStr<'a>) -> LinkIndex {
+    pub fn allocate_link(&mut self, url: CowStr<'a>, title: CowStr<'a>) -> LinkIndex {
         let ix = self.links.len();
-        self.links.push((ty, url, title));
+        self.links.push((url, title));
         LinkIndex(ix)
-    }
-
-    pub fn allocate_alignment(&mut self, alignment: Vec<Alignment>) -> AlignmentIndex {
-        let ix = self.alignments.len();
-        self.alignments.push(alignment);
-        AlignmentIndex(ix)
     }
 }
 
@@ -1265,7 +826,7 @@ impl<'a> Index<CowIndex> for Allocations<'a> {
 }
 
 impl<'a> Index<LinkIndex> for Allocations<'a> {
-    type Output = (LinkType, CowStr<'a>, CowStr<'a>);
+    type Output = (CowStr<'a>, CowStr<'a>);
 
     fn index(&self, ix: LinkIndex) -> &Self::Output {
         self.links.index(ix.0)
@@ -1280,21 +841,6 @@ impl<'a> Index<AlignmentIndex> for Allocations<'a> {
     }
 }
 
-/// A struct containing information on the reachability of certain inline HTML
-/// elements. In particular, for cdata elements (`<![CDATA[`), processing
-/// elements (`<?`) and declarations (`<!DECLARATION`). The respectives usizes
-/// represent the indices before which a scan will always fail and can hence
-/// be skipped.
-#[derive(Clone, Default)]
-pub(crate) struct HtmlScanGuard {
-    pub cdata: usize,
-    pub processing: usize,
-    pub declaration: usize,
-}
-
-pub type BrokenLinkCallback<'input, 'borrow> =
-    Option<&'borrow mut dyn FnMut(BrokenLink<'input>) -> Option<(CowStr<'input>, CowStr<'input>)>>;
-
 /// Markdown event and source range iterator.
 ///
 /// Generates tuples where the first element is the markdown event and the second
@@ -1302,18 +848,11 @@ pub type BrokenLinkCallback<'input, 'borrow> =
 ///
 /// Constructed from a `Parser` using its
 /// [`into_offset_iter`](struct.Parser.html#method.into_offset_iter) method.
-pub struct OffsetIter<'a, 'b> {
-    inner: Parser<'a, 'b>,
+pub struct OffsetIter<'a> {
+    inner: Parser<'a>,
 }
 
-impl<'a, 'b> OffsetIter<'a, 'b> {
-    /// Returns a reference to the internal reference definition tracker.
-    pub fn reference_definitions(&self) -> &RefDefs {
-        self.inner.reference_definitions()
-    }
-}
-
-impl<'a, 'b> Iterator for OffsetIter<'a, 'b> {
+impl<'a> Iterator for OffsetIter<'a> {
     type Item = (Event<'a>, Range<usize>);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1353,32 +892,11 @@ fn item_to_tag<'a>(item: &Item, allocs: &Allocations<'a>) -> Tag<'a> {
         ItemBody::Strong => Tag::Strong,
         ItemBody::Strikethrough => Tag::Strikethrough,
         ItemBody::Link(link_ix) => {
-            let &(ref link_type, ref url, ref title) = allocs.index(link_ix);
-            Tag::Link(*link_type, url.clone(), title.clone())
+            let &(ref url, ref title) = allocs.index(link_ix);
+            Tag::Link(url.clone(), title.clone())
         }
-        ItemBody::Image(link_ix) => {
-            let &(ref link_type, ref url, ref title) = allocs.index(link_ix);
-            Tag::Image(*link_type, url.clone(), title.clone())
-        }
-        ItemBody::Heading(level) => Tag::Heading(level),
-        ItemBody::FencedCodeBlock(cow_ix) => {
-            Tag::CodeBlock(CodeBlockKind::Fenced(allocs[cow_ix].clone()))
-        }
-        ItemBody::IndentCodeBlock => Tag::CodeBlock(CodeBlockKind::Indented),
+        ItemBody::FencedCodeBlock(cow_ix) => Tag::CodeBlock(allocs[cow_ix].clone()),
         ItemBody::BlockQuote => Tag::BlockQuote,
-        ItemBody::List(_, c, listitem_start) => {
-            if c == b'.' || c == b')' {
-                Tag::List(Some(listitem_start))
-            } else {
-                Tag::List(None)
-            }
-        }
-        ItemBody::ListItem(_) => Tag::Item,
-        ItemBody::TableHead => Tag::TableHead,
-        ItemBody::TableCell => Tag::TableCell,
-        ItemBody::TableRow => Tag::TableRow,
-        ItemBody::Table(alignment_ix) => Tag::Table(allocs[alignment_ix].clone()),
-        ItemBody::FootnoteDefinition(cow_ix) => Tag::FootnoteDefinition(allocs[cow_ix].clone()),
         _ => panic!("unexpected item body {:?}", item.body),
     }
 }
@@ -1388,55 +906,26 @@ fn item_to_event<'a>(item: Item, text: &'a str, allocs: &Allocations<'a>) -> Eve
         ItemBody::Text => return Event::Text(text[item.start..item.end].into()),
         ItemBody::Code(cow_ix) => return Event::Code(allocs[cow_ix].clone()),
         ItemBody::SynthesizeText(cow_ix) => return Event::Text(allocs[cow_ix].clone()),
-        ItemBody::SynthesizeChar(c) => return Event::Text(c.into()),
-        ItemBody::Html => return Event::Html(text[item.start..item.end].into()),
-        ItemBody::OwnedHtml(cow_ix) => return Event::Html(allocs[cow_ix].clone()),
         ItemBody::SoftBreak => return Event::SoftBreak,
         ItemBody::HardBreak => return Event::HardBreak,
-        ItemBody::FootnoteReference(cow_ix) => {
-            return Event::FootnoteReference(allocs[cow_ix].clone())
-        }
-        ItemBody::TaskListMarker(checked) => return Event::TaskListMarker(checked),
-        ItemBody::Rule => return Event::Rule,
 
         ItemBody::Paragraph => Tag::Paragraph,
         ItemBody::Emphasis => Tag::Emphasis,
         ItemBody::Strong => Tag::Strong,
         ItemBody::Strikethrough => Tag::Strikethrough,
         ItemBody::Link(link_ix) => {
-            let &(ref link_type, ref url, ref title) = allocs.index(link_ix);
-            Tag::Link(*link_type, url.clone(), title.clone())
+            let &(ref url, ref title) = allocs.index(link_ix);
+            Tag::Link(url.clone(), title.clone())
         }
-        ItemBody::Image(link_ix) => {
-            let &(ref link_type, ref url, ref title) = allocs.index(link_ix);
-            Tag::Image(*link_type, url.clone(), title.clone())
-        }
-        ItemBody::Heading(level) => Tag::Heading(level),
-        ItemBody::FencedCodeBlock(cow_ix) => {
-            Tag::CodeBlock(CodeBlockKind::Fenced(allocs[cow_ix].clone()))
-        }
-        ItemBody::IndentCodeBlock => Tag::CodeBlock(CodeBlockKind::Indented),
+        ItemBody::FencedCodeBlock(cow_ix) => Tag::CodeBlock(allocs[cow_ix].clone()),
         ItemBody::BlockQuote => Tag::BlockQuote,
-        ItemBody::List(_, c, listitem_start) => {
-            if c == b'.' || c == b')' {
-                Tag::List(Some(listitem_start))
-            } else {
-                Tag::List(None)
-            }
-        }
-        ItemBody::ListItem(_) => Tag::Item,
-        ItemBody::TableHead => Tag::TableHead,
-        ItemBody::TableCell => Tag::TableCell,
-        ItemBody::TableRow => Tag::TableRow,
-        ItemBody::Table(alignment_ix) => Tag::Table(allocs[alignment_ix].clone()),
-        ItemBody::FootnoteDefinition(cow_ix) => Tag::FootnoteDefinition(allocs[cow_ix].clone()),
         _ => panic!("unexpected item body {:?}", item.body),
     };
 
     Event::Start(tag)
 }
 
-impl<'a, 'b> Iterator for Parser<'a, 'b> {
+impl<'a> Iterator for Parser<'a> {
     type Item = Event<'a>;
 
     fn next(&mut self) -> Option<Event<'a>> {
@@ -1466,7 +955,7 @@ impl<'a, 'b> Iterator for Parser<'a, 'b> {
     }
 }
 
-impl FusedIterator for Parser<'_, '_> {}
+impl FusedIterator for Parser<'_> {}
 
 #[cfg(test)]
 mod test {
@@ -1474,16 +963,6 @@ mod test {
     use crate::tree::Node;
 
     // TODO: move these tests to tests/html.rs?
-
-    fn parser_with_extensions(text: &str) -> Parser<'_, 'static> {
-        let mut opts = Options::empty();
-        opts.insert(Options::ENABLE_TABLES);
-        opts.insert(Options::ENABLE_FOOTNOTES);
-        opts.insert(Options::ENABLE_STRIKETHROUGH);
-        opts.insert(Options::ENABLE_TASKLISTS);
-
-        Parser::new_ext(text, opts)
-    }
 
     #[test]
     #[cfg(target_pointer_width = "64")]
@@ -1500,6 +979,11 @@ mod test {
     }
 
     #[test]
+    fn basic_link() {
+        assert_eq!(5, Parser::new("[foo](bar)").count());
+    }
+
+    #[test]
     fn single_open_fish_bracket() {
         // dont crash
         assert_eq!(3, Parser::new("<").count());
@@ -1508,7 +992,7 @@ mod test {
     #[test]
     fn lone_hashtag() {
         // dont crash
-        assert_eq!(2, Parser::new("#").count());
+        assert_eq!(3, Parser::new("#").count());
     }
 
     #[test]
@@ -1521,65 +1005,65 @@ mod test {
     #[test]
     fn issue_320() {
         // dont crash
-        parser_with_extensions(":\r\t> |\r:\r\t> |\r").count();
+        Parser::new(":\r\t> |\r:\r\t> |\r").count();
     }
 
     #[test]
     fn issue_319() {
         // dont crash
-        parser_with_extensions("|\r-]([^|\r-]([^").count();
-        parser_with_extensions("|\r\r=][^|\r\r=][^car").count();
+        Parser::new("|\r-]([^|\r-]([^").count();
+        Parser::new("|\r\r=][^|\r\r=][^car").count();
     }
 
     #[test]
     fn issue_303() {
         // dont crash
-        parser_with_extensions("[^\r\ra]").count();
-        parser_with_extensions("\r\r]Z[^\x00\r\r]Z[^\x00").count();
+        Parser::new("[^\r\ra]").count();
+        Parser::new("\r\r]Z[^\x00\r\r]Z[^\x00").count();
     }
 
     #[test]
     fn issue_313() {
         // dont crash
-        parser_with_extensions("*]0[^\r\r*]0[^").count();
-        parser_with_extensions("[^\r> `][^\r> `][^\r> `][").count();
+        Parser::new("*]0[^\r\r*]0[^").count();
+        Parser::new("[^\r> `][^\r> `][^\r> `][").count();
     }
 
     #[test]
     fn issue_311() {
         // dont crash
-        parser_with_extensions("\\\u{0d}-\u{09}\\\u{0d}-\u{09}").count();
+        Parser::new("\\\u{0d}-\u{09}\\\u{0d}-\u{09}").count();
     }
 
     #[test]
     fn issue_283() {
         let input = std::str::from_utf8(b"\xf0\x9b\xb2\x9f<td:^\xf0\x9b\xb2\x9f").unwrap();
         // dont crash
-        parser_with_extensions(input).count();
+        Parser::new(input).count();
     }
 
     #[test]
     fn issue_289() {
         // dont crash
-        parser_with_extensions("> - \\\n> - ").count();
-        parser_with_extensions("- \n\n").count();
+        Parser::new("> - \\\n> - ").count();
+        Parser::new("- \n\n").count();
     }
 
     #[test]
     fn issue_306() {
         // dont crash
-        parser_with_extensions("*\r_<__*\r_<__*\r_<__*\r_<__").count();
+        Parser::new("*\r_<__*\r_<__*\r_<__*\r_<__").count();
     }
 
     #[test]
     fn issue_305() {
         // dont crash
-        parser_with_extensions("_6**6*_*").count();
+        Parser::new("_6**6*_*").count();
     }
 
     #[test]
     fn another_emphasis_panic() {
-        parser_with_extensions("*__#_#__*").count();
+        Parser::new("*__#_#__*").count();
     }
 
     #[test]
@@ -1593,63 +1077,6 @@ mod test {
     }
 
     #[test]
-    fn reference_link_offsets() {
-        let range =
-            Parser::new("# H1\n[testing][Some reference]\n\n[Some reference]: https://github.com")
-                .into_offset_iter()
-                .filter_map(|(ev, range)| match ev {
-                    Event::Start(Tag::Link(LinkType::Reference, ..), ..) => Some(range),
-                    _ => None,
-                })
-                .next()
-                .unwrap();
-        assert_eq!(5..30, range);
-    }
-
-    #[test]
-    fn footnote_offsets() {
-        let range = parser_with_extensions("Testing this[^1] out.\n\n[^1]: Footnote.")
-            .into_offset_iter()
-            .filter_map(|(ev, range)| match ev {
-                Event::FootnoteReference(..) => Some(range),
-                _ => None,
-            })
-            .next()
-            .unwrap();
-        assert_eq!(12..16, range);
-    }
-
-    #[test]
-    fn table_offset() {
-        let markdown = "a\n\nTesting|This|Outtt\n--|:--:|--:\nSome Data|Other data|asdf";
-        let event_offset = parser_with_extensions(markdown)
-            .into_offset_iter()
-            .map(|(_ev, range)| range)
-            .nth(3)
-            .unwrap();
-        let expected_offset = 3..59;
-        assert_eq!(expected_offset, event_offset);
-    }
-
-    #[test]
-    fn table_cell_span() {
-        let markdown = "a|b|c\n--|--|--\na|  |c";
-        let event_offset = parser_with_extensions(markdown)
-            .into_offset_iter()
-            .filter_map(|(ev, span)| match ev {
-                Event::Start(Tag::TableCell) => Some(span),
-                _ => None,
-            })
-            .nth(4)
-            .unwrap();
-        let expected_offset_start = "a|b|c\n--|--|--\na|".len();
-        assert_eq!(
-            expected_offset_start..(expected_offset_start + 2),
-            event_offset
-        );
-    }
-
-    #[test]
     fn offset_iter_issue_378() {
         let event_offsets: Vec<_> = Parser::new("a [b](c) d")
             .into_offset_iter()
@@ -1660,120 +1087,12 @@ mod test {
     }
 
     #[test]
-    fn offset_iter_issue_404() {
-        let event_offsets: Vec<_> = Parser::new("###\n")
-            .into_offset_iter()
-            .map(|(_ev, range)| range)
-            .collect();
-        let expected_offsets = vec![(0..4), (0..4)];
-        assert_eq!(expected_offsets, event_offsets);
-    }
-
-    // FIXME: add this one regression suite
-    #[test]
-    fn link_def_at_eof() {
-        let test_str = "[My site][world]\n\n[world]: https://vincentprouillet.com";
-        let expected = "<p><a href=\"https://vincentprouillet.com\">My site</a></p>\n";
-
-        let mut buf = String::new();
-        crate::html::push_html(&mut buf, Parser::new(test_str));
-        assert_eq!(expected, buf);
-    }
-
-    #[test]
-    fn no_footnote_refs_without_option() {
-        let test_str = "a [^a]\n\n[^a]: yolo";
-        let expected = "<p>a <a href=\"yolo\">^a</a></p>\n";
-
-        let mut buf = String::new();
-        crate::html::push_html(&mut buf, Parser::new(test_str));
-        assert_eq!(expected, buf);
-    }
-
-    #[test]
-    fn ref_def_at_eof() {
-        let test_str = "[test]:\\";
-        let expected = "";
-
-        let mut buf = String::new();
-        crate::html::push_html(&mut buf, Parser::new(test_str));
-        assert_eq!(expected, buf);
-    }
-
-    #[test]
-    fn ref_def_cr_lf() {
-        let test_str = "[a]: /u\r\n\n[a]";
-        let expected = "<p><a href=\"/u\">a</a></p>\n";
-
-        let mut buf = String::new();
-        crate::html::push_html(&mut buf, Parser::new(test_str));
-        assert_eq!(expected, buf);
-    }
-
-    #[test]
-    fn no_dest_refdef() {
-        let test_str = "[a]:";
-        let expected = "<p>[a]:</p>\n";
-
-        let mut buf = String::new();
-        crate::html::push_html(&mut buf, Parser::new(test_str));
-        assert_eq!(expected, buf);
-    }
-
-    #[test]
-    fn broken_links_called_only_once() {
-        for &(markdown, expected) in &[
-            ("See also [`g()`][crate::g].", 1),
-            ("See also [`g()`][crate::g][].", 1),
-            ("[brokenlink1] some other node [brokenlink2]", 2),
-        ] {
-            let mut times_called = 0;
-            let callback = &mut |_broken_link: BrokenLink| {
-                times_called += 1;
-                None
-            };
-            let parser =
-                Parser::new_with_broken_link_callback(markdown, Options::empty(), Some(callback));
-            for _ in parser {}
-            assert_eq!(times_called, expected);
-        }
-    }
-
-    #[test]
-    fn simple_broken_link_callback() {
-        let test_str = "This is a link w/o def: [hello][world]";
-        let mut callback = |broken_link: BrokenLink| {
-            assert_eq!("world", broken_link.reference.as_ref());
-            assert_eq!(&test_str[broken_link.span], "[hello][world]");
-            let url = "YOLO".into();
-            let title = "SWAG".to_owned().into();
-            Some((url, title))
-        };
-        let parser =
-            Parser::new_with_broken_link_callback(test_str, Options::empty(), Some(&mut callback));
-        let mut link_tag_count = 0;
-        for (typ, url, title) in parser.filter_map(|event| match event {
-            Event::Start(tag) | Event::End(tag) => match tag {
-                Tag::Link(typ, url, title) => Some((typ, url, title)),
-                _ => None,
-            },
-            _ => None,
-        }) {
-            link_tag_count += 1;
-            assert_eq!(typ, LinkType::ReferenceUnknown);
-            assert_eq!(url.as_ref(), "YOLO");
-            assert_eq!(title.as_ref(), "SWAG");
-        }
-        assert!(link_tag_count > 0);
-    }
-
-    #[test]
     fn code_block_kind_check_fenced() {
         let parser = Parser::new("hello\n```test\ntadam\n```");
         let mut found = 0;
         for (ev, _range) in parser.into_offset_iter() {
             match ev {
-                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(syntax))) => {
+                Event::Start(Tag::CodeBlock(syntax)) => {
                     assert_eq!(syntax.as_ref(), "test");
                     found += 1;
                 }
@@ -1781,81 +1100,5 @@ mod test {
             }
         }
         assert_eq!(found, 1);
-    }
-
-    #[test]
-    fn code_block_kind_check_indented() {
-        let parser = Parser::new("hello\n\n    ```test\n    tadam\nhello");
-        let mut found = 0;
-        for (ev, _range) in parser.into_offset_iter() {
-            match ev {
-                Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)) => {
-                    found += 1;
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(found, 1);
-    }
-
-    #[test]
-    fn ref_defs() {
-        let input = r###"[a B c]: http://example.com
-[another]: https://google.com
-
-text
-
-[final ONE]: http://wikipedia.org
-"###;
-        let mut parser = Parser::new(input);
-
-        assert!(parser.reference_definitions().get("a b c").is_some());
-        assert!(parser.reference_definitions().get("nope").is_none());
-
-        if let Some(_event) = parser.next() {
-            // testing keys with shorter lifetimes than parser and its input
-            let s = "final one".to_owned();
-            let link_def = parser.reference_definitions().get(&s).unwrap();
-            let span = &input[link_def.span.clone()];
-            assert_eq!(span, "[final ONE]: http://wikipedia.org");
-        }
-    }
-
-    #[test]
-    fn common_lifetime_patterns_allowed<'b>() {
-        let temporary_str = String::from("xyz");
-
-        // NOTE: this is a limitation of Rust, it doesn't allow putting lifetime parameters on the closure itself.
-        // Hack it by attaching the lifetime to the test function instead.
-        // TODO: why is the `'b` lifetime required at all? Changing it to `'_` breaks things :(
-        let mut closure = |link: BrokenLink<'b>| Some(("#".into(), link.reference.into()));
-
-        fn function<'a>(link: BrokenLink<'a>) -> Option<(CowStr<'a>, CowStr<'a>)> {
-            Some(("#".into(), link.reference))
-        }
-
-        for _ in Parser::new_with_broken_link_callback(
-            "static lifetime",
-            Options::empty(),
-            Some(&mut closure),
-        ) {}
-        /* This fails to compile. Because the closure can't say `for <'a> fn(BrokenLink<'a>) ->
-         * CowStr<'a>` and has to use the enclosing `'b` lifetime parameter, `temporary_str` lives
-         * shorter than `'b`. I think this is unlikely to occur in real life, and if it does, the
-         * fix is simple: move it out to a function that allows annotating the lifetimes.
-         */
-        //for _ in Parser::new_with_broken_link_callback(&temporary_str, Options::empty(), Some(&mut callback)) {
-        //}
-
-        for _ in Parser::new_with_broken_link_callback(
-            "static lifetime",
-            Options::empty(),
-            Some(&mut function),
-        ) {}
-        for _ in Parser::new_with_broken_link_callback(
-            &temporary_str,
-            Options::empty(),
-            Some(&mut function),
-        ) {}
     }
 }

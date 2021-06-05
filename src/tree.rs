@@ -124,15 +124,6 @@ impl<T: Default> Tree<T> {
         self.spine.last().copied()
     }
 
-    /// Look at grandparent node.
-    pub(crate) fn peek_grandparent(&self) -> Option<TreeIndex> {
-        if self.spine.len() >= 2 {
-            Some(self.spine[self.spine.len() - 2])
-        } else {
-            None
-        }
-    }
-
     /// Returns true when there are no nodes other than the root node
     /// in the tree, false otherwise.
     pub(crate) fn is_empty(&self) -> bool {
